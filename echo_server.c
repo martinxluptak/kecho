@@ -7,7 +7,14 @@
 
 #define BUF_SIZE 4096
 
-static int get_request(struct socket *sock, unsigned char *buf, size_t size)
+static struct workqueue_struct *my_wq;
+
+struct work_struct_data {
+    struct work_struct my_work;
+    struct socket *client;
+};
+
+static int handle_request(struct socket *sock, unsigned char *buf, size_t size)
 {
     struct msghdr msg;
     struct kvec vec;
@@ -24,93 +31,70 @@ static int get_request(struct socket *sock, unsigned char *buf, size_t size)
     msg.msg_controllen = 0;
     msg.msg_flags = 0;
 
-    printk(MODULE_NAME ": start get response\n");
     /* get msg */
     length = kernel_recvmsg(sock, &msg, &vec, size, size, msg.msg_flags);
-    printk(MODULE_NAME ": get request = %s\n", buf);
+    if (length == 0)
+        return length;
 
-    return length;
-}
-
-static int send_request(struct socket *sock, unsigned char *buf, size_t size)
-{
-    int length;
-    struct kvec vec;
-    struct msghdr msg;
-
-    msg.msg_name = NULL;
-    msg.msg_namelen = 0;
-    msg.msg_control = NULL;
-    msg.msg_controllen = 0;
-    msg.msg_flags = 0;
-
-    vec.iov_base = buf;
-    vec.iov_len = strlen(buf);
-
-    printk(MODULE_NAME ": start send request.\n");
-
+    printk("len,msg: %s, %ld\n", buf, strlen(buf));
     length = kernel_sendmsg(sock, &msg, &vec, 1, strlen(buf) - 1);
-
-    printk(MODULE_NAME ": send request = %s\n", buf);
-
     return length;
 }
 
-static int echo_server_worker(void *arg)
+static void work_handler(struct work_struct *work)
 {
-    struct socket *sock;
     unsigned char *buf;
+    struct work_struct_data *wsdata = (struct work_struct_data *) work;
     int res;
-
-    sock = (struct socket *) arg;
-    allow_signal(SIGKILL);
-    allow_signal(SIGTERM);
 
     buf = kmalloc(BUF_SIZE, GFP_KERNEL);
     if (!buf) {
-        printk(KERN_ERR MODULE_NAME ": kmalloc error....\n");
-        return -1;
+        printk("server: recvbuf kmalloc error!\n");
+        return;
     }
+    memset(buf, 0, BUF_SIZE);
 
-    while (!kthread_should_stop()) {
-        res = get_request(sock, buf, BUF_SIZE - 1);
+    while (1) {
+        res = handle_request(wsdata->client, buf, BUF_SIZE - 1);
         if (res <= 0) {
             if (res) {
                 printk(KERN_ERR MODULE_NAME ": get request error = %d\n", res);
             }
             break;
         }
-
-        res = send_request(sock, buf, strlen(buf));
-        if (res < 0) {
-            printk(KERN_ERR MODULE_NAME ": send request error = %d\n", res);
-            break;
-        }
     }
 
-    res = get_request(sock, buf, BUF_SIZE - 1);
-    res = send_request(sock, buf, strlen(buf));
-
-    kernel_sock_shutdown(sock, SHUT_RDWR);
-    sock_release(sock);
     kfree(buf);
-
-    return 0;
+    kernel_sock_shutdown(wsdata->client, SHUT_RDWR);
+    sock_release(wsdata->client);
+    printk("exiting work_handler...\n");
 }
 
 int echo_server_daemon(void *arg)
 {
     struct echo_server_param *param = arg;
     struct socket *sock;
-    struct task_struct *thread;
     int error;
 
     allow_signal(SIGKILL);
     allow_signal(SIGTERM);
 
-    while (!kthread_should_stop()) {
+
+#ifdef HIGH_PRI
+    struct workqueue_attrs *attr;
+    attr = alloc_workqueue_attrs(__GFP_HIGH);
+    apply_workqueue_attrs(my_wq, attr);
+#else
+    my_wq = create_workqueue("my_queue");
+#endif
+
+    // my_wq = alloc_workqueue("my_queue",WQ_MEM_RECLAIM | WQ_HIGHPRI, 1);
+
+    while (1) {
+        struct work_struct_data *wsdata;
         /* using blocking I/O */
         error = kernel_accept(param->listen_sock, &sock, 0);
+        printk("accepted socket\n");
         if (error < 0) {
             if (signal_pending(current))
                 break;
@@ -118,13 +102,20 @@ int echo_server_daemon(void *arg)
             continue;
         }
 
-        /* start server worker */
-        thread = kthread_run(echo_server_worker, sock, MODULE_NAME);
-        if (IS_ERR(thread)) {
-            printk(KERN_ERR MODULE_NAME ": create worker thread error = %d\n",
-                   error);
-            continue;
+        if (my_wq) {
+            /*set workqueue data*/
+            wsdata = (struct work_struct_data *) kmalloc(
+                sizeof(struct work_struct_data), GFP_KERNEL);
+            wsdata->client = sock;
+
+            /*put task into workqueue*/
+            if (wsdata) {
+                printk("starting work\n");
+                INIT_WORK(&wsdata->my_work, work_handler);
+                error = queue_work(my_wq, &wsdata->my_work);
+            }
         }
+        printk("server: accept ok, Connection Established.\n");
     }
 
     return 0;
