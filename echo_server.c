@@ -36,8 +36,8 @@ static int handle_request(struct socket *sock, unsigned char *buf, size_t size)
     if (length == 0)
         return length;
 
-    printk("len,msg: %s, %ld\n", buf, strlen(buf));
-    length = kernel_sendmsg(sock, &msg, &vec, 1, strlen(buf) - 1);
+    printk("len,msg: %s, %d\n", buf, length);
+    length = kernel_sendmsg(sock, &msg, &vec, 1, length);
     return length;
 }
 
